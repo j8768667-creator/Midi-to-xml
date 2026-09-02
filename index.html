@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>Scaler 3 Conversion Toolkit v2.6</title>
+    <title>Scaler 3 Conversion Toolkit v2.7</title>
     <style>
         :root {
             --bg: #f4f6fa;
@@ -322,8 +322,8 @@
 </head>
 <body>
     <main>
-        <h1>Scaler 3 Conversion Toolkit v2.6</h1>
-        <p class="sub">MIDI ↔ Scaler 3 XML / MusicXML – now with multi‑part MIDI export (melody + chords).</p>
+        <h1>Scaler 3 Conversion Toolkit v2.7</h1>
+        <p class="sub">MIDI ↔ Scaler 3 XML / MusicXML – extract melody as individual notes, chords as blocks.</p>
 
         <div class="tabs">
             <button class="tab active" data-tab="typed">Typed chords → XML / MIDI</button>
@@ -442,11 +442,11 @@
             </div>
         </section>
 
-        <!-- XML → MIDI (multi‑part supported) -->
+        <!-- XML → MIDI (with melody extraction) -->
         <section id="xml" class="panel">
             <div class="card">
                 <h2>XML → MIDI</h2>
-                <p class="note">Supports <b>Scaler 3</b> (.xml) and <b>MusicXML</b> (.xml). MusicXML parts become separate MIDI tracks.</p>
+                <p class="note">Supports <b>Scaler 3</b> (.xml) and <b>MusicXML</b> (.xml). Select which part is melody (individual notes).</p>
                 <div id="xmlDrop" class="drop" tabindex="0">
                     <strong>Drop an XML file here</strong>
                     <span>or tap to choose a .xml file</span>
@@ -486,16 +486,23 @@
                         <input id="xmlDefaultBars" type="number" min="0.25" step="0.25" value="1">
                     </div>
                 </div>
+                <div style="margin-top:12px">
+                    <label for="xmlMelodyPart">Select melody part (individual notes):</label>
+                    <select id="xmlMelodyPart">
+                        <option value="">None (all parts as chords)</option>
+                    </select>
+                    <p class="note" style="margin-top:6px">If a part is selected as melody, its notes will be exported with their original timing. All other parts will be grouped per measure as chords.</p>
+                </div>
                 <div class="controls">
-                    <button id="xmlApplyBars" class="secondary">Apply bars to all parts</button>
+                    <button id="xmlApplyBars" class="secondary">Apply bars to all chords</button>
                     <button id="xmlExportMidi">Export MIDI (multi‑track)</button>
                     <button id="xmlClear" class="secondary">Clear</button>
                 </div>
             </div>
 
             <div id="xmlTableCard" class="card hidden">
-                <h2>Chord durations per part</h2>
-                <p class="note">Each part becomes a separate track in the exported MIDI file. Adjust bars per chord – changes apply to all parts.</p>
+                <h2>Chord durations per part (grouped)</h2>
+                <p class="note">Chords are grouped per measure. Melody part (if selected) is not shown here – it will be exported as individual note events.</p>
                 <div class="table-wrap">
                     <table>
                         <thead><tr><th>#</th><th>Part</th><th>Chord</th><th>Notes</th><th>Bars</th></tr></thead>
@@ -517,8 +524,9 @@
             midiName: "",
             midiChords: [],
             xmlName: "",
-            xmlParts: [], // array of { partName, chords: [{name, notes, bars}] }
-            xmlFormat: ""
+            xmlParts: [], // each part: { partName, chords: [{name, notes, bars}], melodyNotes: [{pitch, start, duration}] }
+            xmlFormat: "",
+            xmlMelodyPart: null // index of part selected as melody
         };
         let midiRawData = null;
 
@@ -565,7 +573,6 @@
                     console.warn('File System Access API error:', e);
                 }
             }
-            // Fallback
             const blob = new Blob([data], { type });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -579,7 +586,7 @@
         }
 
         // ============================================================
-        // CHORD RECOGNITION ENGINE - v2.4
+        // CHORD RECOGNITION ENGINE (unchanged)
         // ============================================================
 
         const ROOTS = {
@@ -778,7 +785,7 @@
         }
 
         // ============================================================
-        // TYPED CHORD PARSER
+        // TYPED CHORD PARSER (unchanged)
         // ============================================================
 
         function parseTyped() {
@@ -885,12 +892,15 @@
         }, { passive: true });
 
         // ============================================================
-        // MIDI WRITER – now supports multi‑track
+        // MIDI WRITER – now supports individual note tracks
         // ============================================================
 
         /**
-         * Create a MIDI file with one or more tracks.
-         * @param {Array} trackData - array of { chords: [{name, notes, bars}], name }
+         * Create a MIDI file with multiple tracks.
+         * Each track can be either:
+         * - chord-based: array of { name, notes, bars }
+         * - melody: array of { pitch, start (quarters), duration (quarters) }
+         * @param {Array} trackData - each: { type: 'chord'|'melody', name, data }
          * @param {number} tempo
          * @param {number} velocity
          */
@@ -903,32 +913,40 @@
             ];
             const tracks = [];
 
-            for (const part of trackData) {
+            for (const track of trackData) {
                 const events = [];
                 events.push({ tick: 0, data: [0xff, 0x51, 0x03, (mpqn >> 16) & 255, (mpqn >> 8) & 255, mpqn & 255] });
                 events.push({ tick: 0, data: [0xff, 0x58, 0x04, 4, 2, 24, 8] });
-                // Track name meta event
-                const nameBytes = strBytes(part.name || "Track");
+                const nameBytes = strBytes(track.name || "Track");
                 events.push({ tick: 0, data: [0xff, 0x03, nameBytes.length, ...nameBytes] });
 
-                let tick = 0;
-                for (const c of part.chords) {
-                    const dur = Math.max(1, Math.round(c.bars * barTicks));
-                    const notes = c.notes;
-                    // Note on
-                    for (const n of notes) {
-                        events.push({ tick, data: [0x90, n & 127, velocity] });
+                if (track.type === 'chord') {
+                    let tick = 0;
+                    for (const c of track.data) {
+                        const dur = Math.max(1, Math.round(c.bars * barTicks));
+                        const notes = c.notes;
+                        for (const n of notes) {
+                            events.push({ tick, data: [0x90, n & 127, velocity] });
+                        }
+                        for (const n of notes) {
+                            events.push({ tick: tick + dur, data: [0x80, n & 127, 0] });
+                        }
+                        tick += dur;
                     }
-                    // Note off
-                    for (const n of notes) {
-                        events.push({ tick: tick + dur, data: [0x80, n & 127, 0] });
+                } else if (track.type === 'melody') {
+                    // data: array of { pitch, start (quarters), duration (quarters) }
+                    for (const note of track.data) {
+                        const tickStart = Math.round(note.start * ppq);
+                        const tickDur = Math.max(1, Math.round(note.duration * ppq));
+                        events.push({ tick: tickStart, data: [0x90, note.pitch & 127, velocity] });
+                        events.push({ tick: tickStart + tickDur, data: [0x80, note.pitch & 127, 0] });
                     }
-                    tick += dur;
                 }
-                // End of track
-                events.push({ tick, data: [0xff, 0x2f, 0] });
 
-                // Sort events by tick, note off before note on at same tick
+                // End of track
+                const lastTick = Math.max(...events.map(e => e.tick), 0);
+                events.push({ tick: lastTick, data: [0xff, 0x2f, 0] });
+
                 events.sort((a, b) => {
                     if (a.tick !== b.tick) return a.tick - b.tick;
                     const pa = ((a.data[0] & 0xf0) === 0x80) ? 0 : 1;
@@ -949,9 +967,9 @@
             return new Uint8Array(all);
         }
 
-        // For backward compatibility: single track
+        // Single-track for typed chords
         function makeMidi(chords, tempo, velocity) {
-            return makeMultiTrackMidi([{ chords, name: "Melody" }], tempo, velocity);
+            return makeMultiTrackMidi([{ type: 'chord', name: 'Chords', data: chords }], tempo, velocity);
         }
 
         function vlq(n) {
@@ -966,7 +984,6 @@
 
         function strBytes(s) { return [...s].map(c => c.charCodeAt(0) & 255); }
 
-        // Typed export uses single track
         $("typedExportMidi").addEventListener("click", async () => {
             try {
                 state.typed = parseTyped();
@@ -1296,7 +1313,7 @@
         }, { passive: true });
 
         // ============================================================
-        // XML → MIDI — MULTI‑PART PARSER (Scaler 3 + MusicXML)
+        // XML → MIDI — MULTI‑PART PARSER with timing
         // ============================================================
 
         function noteToMidi(step, alter, octave) {
@@ -1306,7 +1323,137 @@
             return 12 * (octave + 1) + steps[s] + (alter || 0);
         }
 
-        // Scaler 3: single part only
+        // Parse MusicXML with timing: returns array of parts with chord groups and individual melody notes
+        function parseMusicXmlWithTiming(doc) {
+            const partNodes = doc.getElementsByTagName("part");
+            if (!partNodes.length) throw new Error("No <part> elements found in MusicXML.");
+
+            const parts = [];
+            for (let pIdx = 0; pIdx < partNodes.length; pIdx++) {
+                const part = partNodes[pIdx];
+                const partName = part.getAttribute("id") || part.getAttribute("part-name") || `Part ${pIdx+1}`;
+                const measures = part.getElementsByTagName("measure");
+                if (!measures.length) continue;
+
+                // Get divisions per quarter from first measure
+                let divisions = 1;
+                const attrs = measures[0].getElementsByTagName("attributes");
+                if (attrs.length) {
+                    const divs = attrs[0].getElementsByTagName("divisions");
+                    if (divs.length) divisions = Number(divs[0].textContent) || 1;
+                }
+
+                let currentTime = 0; // in quarters
+                const chordGroups = []; // each entry: { start, duration, pitches }
+                const melodyNotes = []; // each: { pitch, start, duration }
+
+                for (let mIdx = 0; mIdx < measures.length; mIdx++) {
+                    const measure = measures[mIdx];
+                    const measureChildren = measure.children;
+                    let measureDurationDiv = 0;
+                    // We need to compute total duration of this measure in divisions
+                    // Iterate over children to collect note durations and also process notes
+                    // We'll first collect all note elements and their durations
+                    const noteElements = measure.getElementsByTagName("note");
+                    const noteDurations = [];
+                    let hasNotes = false;
+                    for (const note of noteElements) {
+                        if (note.getElementsByTagName("rest").length > 0) {
+                            // Rest has duration, we need to add it
+                            const durEl = note.getElementsByTagName("duration");
+                            if (durEl.length) {
+                                const dur = Number(durEl[0].textContent) || 0;
+                                measureDurationDiv += dur;
+                            }
+                            continue;
+                        }
+                        if (note.getElementsByTagName("grace").length > 0) continue;
+                        const pitch = note.getElementsByTagName("pitch")[0];
+                        if (!pitch) continue;
+                        const step = pitch.getElementsByTagName("step")[0]?.textContent;
+                        const alterEl = pitch.getElementsByTagName("alter")[0];
+                        const alter = alterEl ? Number(alterEl.textContent) : 0;
+                        const octave = pitch.getElementsByTagName("octave")[0]?.textContent;
+                        const durEl = note.getElementsByTagName("duration");
+                        let durDiv = 0;
+                        if (durEl.length) durDiv = Number(durEl[0].textContent) || 0;
+                        if (step && octave !== undefined) {
+                            const midi = noteToMidi(step, alter, Number(octave));
+                            if (midi !== null && midi >= 0 && midi <= 127) {
+                                // Calculate start time: currentTime + (sum of previous durations in this measure)
+                                const startTime = currentTime + (measureDurationDiv / divisions);
+                                const durQuarters = durDiv / divisions;
+                                melodyNotes.push({ pitch: midi, start: startTime, duration: durQuarters });
+                                noteDurations.push(durDiv);
+                                hasNotes = true;
+                            }
+                        }
+                        measureDurationDiv += durDiv;
+                    }
+
+                    // Also account for <forward> elements
+                    const forwards = measure.getElementsByTagName("forward");
+                    for (const fwd of forwards) {
+                        const durEl = fwd.getElementsByTagName("duration");
+                        if (durEl.length) {
+                            measureDurationDiv += Number(durEl[0].textContent) || 0;
+                        }
+                    }
+
+                    // If we have notes, create a chord group for this measure (using all pitches)
+                    if (hasNotes) {
+                        const pitches = [];
+                        // Re-extract pitches for chord grouping (from note elements)
+                        const notesInMeasure = measure.getElementsByTagName("note");
+                        for (const note of notesInMeasure) {
+                            if (note.getElementsByTagName("rest").length > 0) continue;
+                            if (note.getElementsByTagName("grace").length > 0) continue;
+                            const pitch = note.getElementsByTagName("pitch")[0];
+                            if (!pitch) continue;
+                            const step = pitch.getElementsByTagName("step")[0]?.textContent;
+                            const alterEl = pitch.getElementsByTagName("alter")[0];
+                            const alter = alterEl ? Number(alterEl.textContent) : 0;
+                            const octave = pitch.getElementsByTagName("octave")[0]?.textContent;
+                            if (step && octave !== undefined) {
+                                const midi = noteToMidi(step, alter, Number(octave));
+                                if (midi !== null && midi >= 0 && midi <= 127) pitches.push(midi);
+                            }
+                        }
+                        if (pitches.length) {
+                            const unique = [...new Set(pitches)].sort((a, b) => a - b);
+                            const durationQuarters = measureDurationDiv / divisions;
+                            chordGroups.push({
+                                start: currentTime,
+                                duration: durationQuarters,
+                                pitches: unique
+                            });
+                        }
+                    }
+
+                    // Advance current time by measure duration
+                    currentTime += measureDurationDiv / divisions;
+                }
+
+                // After processing all measures, we have chordGroups and melodyNotes
+                // Convert chordGroups to our chord format (with bars = duration / 4)
+                const chords = chordGroups.map(g => ({
+                    name: nameChord(g.pitches),
+                    notes: g.pitches,
+                    bars: g.duration / 4 // because 4 quarters per bar
+                }));
+
+                parts.push({
+                    partName,
+                    chords,
+                    melodyNotes
+                });
+            }
+
+            if (!parts.length) throw new Error("No parts could be parsed from MusicXML.");
+            return parts;
+        }
+
+        // Scaler 3 parser (no timing, just chords)
         function parseScalerXml(doc) {
             const root = doc.documentElement;
             const version = root.getAttribute("version");
@@ -1328,51 +1475,7 @@
                 });
                 return { name: nameChord(notes), notes: notes.sort((a, b) => a - b), bars: 1 };
             });
-            return [{ partName: "Scaler 3", chords }];
-        }
-
-        // MusicXML: one part per <part>
-        function parseMusicXml(doc) {
-            const partNodes = doc.getElementsByTagName("part");
-            if (!partNodes.length) throw new Error("No <part> elements found in MusicXML.");
-
-            const parts = [];
-            for (let pIdx = 0; pIdx < partNodes.length; pIdx++) {
-                const part = partNodes[pIdx];
-                const partName = part.getAttribute("id") || part.getAttribute("part-name") || `Part ${pIdx+1}`;
-                const measures = part.getElementsByTagName("measure");
-                if (!measures.length) continue;
-                const chords = [];
-                for (let mIdx = 0; mIdx < measures.length; mIdx++) {
-                    const measure = measures[mIdx];
-                    const notes = measure.getElementsByTagName("note");
-                    const pitches = [];
-                    for (const note of notes) {
-                        if (note.getElementsByTagName("rest").length > 0) continue;
-                        if (note.getElementsByTagName("grace").length > 0) continue;
-                        const pitch = note.getElementsByTagName("pitch")[0];
-                        if (!pitch) continue;
-                        const step = pitch.getElementsByTagName("step")[0]?.textContent;
-                        const alterEl = pitch.getElementsByTagName("alter")[0];
-                        const alter = alterEl ? Number(alterEl.textContent) : 0;
-                        const octave = pitch.getElementsByTagName("octave")[0]?.textContent;
-                        if (step && octave !== undefined) {
-                            const midi = noteToMidi(step, alter, Number(octave));
-                            if (midi !== null && midi >= 0 && midi <= 127) pitches.push(midi);
-                        }
-                    }
-                    if (pitches.length > 0) {
-                        const unique = [...new Set(pitches)].sort((a, b) => a - b);
-                        const name = nameChord(unique);
-                        chords.push({ name, notes: unique, bars: 1 });
-                    }
-                }
-                if (chords.length) {
-                    parts.push({ partName, chords });
-                }
-            }
-            if (!parts.length) throw new Error("No chords could be detected from MusicXML parts.");
-            return parts;
+            return [{ partName: "Scaler 3", chords, melodyNotes: [] }];
         }
 
         function parseXmlFile(text) {
@@ -1383,25 +1486,23 @@
             const root = doc.documentElement;
             if (!root) throw new Error("Empty XML document.");
 
-            // Scaler 3
             if (root.tagName === "CHORDSET") {
                 return { parts: parseScalerXml(doc), format: "Scaler 3" };
             }
 
-            // MusicXML
             if (root.tagName === "score-partwise" || root.tagName === "score-timewise") {
-                return { parts: parseMusicXml(doc), format: "MusicXML" };
+                return { parts: parseMusicXmlWithTiming(doc), format: "MusicXML" };
             }
 
-            // Fallback: try to find parts or measures
+            // Fallback
             const partNodes = doc.getElementsByTagName("part");
             if (partNodes.length > 0) {
                 try {
-                    return { parts: parseMusicXml(doc), format: "MusicXML (auto-detected)" };
+                    return { parts: parseMusicXmlWithTiming(doc), format: "MusicXML (auto)" };
                 } catch (_) { /* fall through */ }
             }
 
-            // Last resort: generic note elements
+            // Generic note elements
             const noteEls = doc.querySelectorAll("note, NOTE, Note");
             if (noteEls.length > 0) {
                 const pitches = [];
@@ -1416,7 +1517,7 @@
                     const unique = [...new Set(pitches)].sort((a, b) => a - b);
                     const name = nameChord(unique);
                     const chords = [{ name, notes: unique, bars: 1 }];
-                    return { parts: [{ partName: "Generic", chords }], format: "Generic XML (note elements)" };
+                    return { parts: [{ partName: "Generic", chords, melodyNotes: [] }], format: "Generic XML" };
                 }
             }
 
@@ -1424,7 +1525,7 @@
         }
 
         // ============================================================
-        // XML LOADING with Preview (multi‑part)
+        // XML LOADING with melody selection
         // ============================================================
 
         async function loadXml(file) {
@@ -1436,20 +1537,26 @@
                 state.xmlName = file.name.replace(/\.xml$/i, "");
                 state.xmlParts = result.parts;
                 state.xmlFormat = result.format;
+                state.xmlMelodyPart = null; // reset
 
-                // Flatten all chords for the table and set same bars for all parts
-                // We'll store bars per chord per part, but for simplicity we treat all chords in all parts with same index share same bar value
-                // We'll use the first part to set bars, then synchronize.
-                // Actually we keep bars per chord in each part, but UI will show rows per part.
+                // Populate melody dropdown
+                const select = $("xmlMelodyPart");
+                select.innerHTML = '<option value="">None (all parts as chords)</option>';
+                result.parts.forEach((p, i) => {
+                    const opt = document.createElement('option');
+                    opt.value = i;
+                    opt.textContent = p.partName + (p.melodyNotes.length ? ` (${p.melodyNotes.length} notes)` : ' (no notes)');
+                    select.appendChild(opt);
+                });
+
                 renderXmlRows();
                 $("xmlSettings").classList.remove("hidden");
                 $("xmlTableCard").classList.remove("hidden");
                 const totalChords = state.xmlParts.reduce((sum, p) => sum + p.chords.length, 0);
-                const totalBars = state.xmlParts.reduce((sum, p) => sum + p.chords.reduce((s, c) => s + c.bars, 0), 0);
                 $("xmlFormatInfo").innerHTML =
-                    `<span><b>Format:</b> ${esc(state.xmlFormat)}</span><span><b>Parts:</b> ${state.xmlParts.length}</span><span><b>Total chords:</b> ${totalChords}</span>`;
+                    `<span><b>Format:</b> ${esc(state.xmlFormat)}</span><span><b>Parts:</b> ${state.xmlParts.length}</span><span><b>Chords:</b> ${totalChords}</span>`;
                 $("xmlStatus").textContent =
-                `${file.name} loaded (${state.xmlFormat}). ${state.xmlParts.length} part(s), ${totalChords} chords.`;
+                    `${file.name} loaded (${state.xmlFormat}). ${state.xmlParts.length} part(s), ${totalChords} chord groups. Select a melody part if needed.`;
                 $("xmlStatus").className = "status ok";
 
                 showXmlPreview(file, text, result);
@@ -1471,7 +1578,7 @@
             card.classList.remove("hidden");
 
             const totalChords = result.parts.reduce((sum, p) => sum + p.chords.length, 0);
-            const totalBars = result.parts.reduce((sum, p) => sum + p.chords.reduce((s, c) => s + c.bars, 0), 0);
+            const totalMelodyNotes = result.parts.reduce((sum, p) => sum + p.melodyNotes.length, 0);
 
             $("xmlFileInfo").innerHTML = `
                 <span>📄 ${esc(file.name)}</span>
@@ -1480,7 +1587,12 @@
             `;
             $("xmlFormatLabel").textContent = result.format;
             $("xmlPartCount").textContent = result.parts.length;
-            $("xmlChordCount").textContent = totalChords;
+            $("xmlChordCount").textContent = totalChords + (totalMelodyNotes ? ' (+ melody notes)' : '');
+            // Total bars: sum of chord durations (if any)
+            let totalBars = 0;
+            for (const p of result.parts) {
+                for (const c of p.chords) totalBars += c.bars;
+            }
             $("xmlBarsTotal").textContent = totalBars.toFixed(1);
 
             const preview = rawText.length > 2000 ? rawText.slice(0, 2000) + '\n… (truncated)' : rawText;
@@ -1497,7 +1609,7 @@
         setupDrop("xmlDrop", "xmlFile", loadXml);
 
         function renderXmlRows() {
-            // Show each chord per part with part name
+            // Only show chord rows (non-melody parts)
             let html = '';
             let idx = 0;
             for (const part of state.xmlParts) {
@@ -1521,7 +1633,10 @@
                 const val = Math.max(.25, Number(e.target.value) || 1);
                 state.xmlParts[partIdx].chords[chordIdx].bars = val;
                 // Update total bars
-                const totalBars = state.xmlParts.reduce((sum, p) => sum + p.chords.reduce((s, c) => s + c.bars, 0), 0);
+                let totalBars = 0;
+                for (const p of state.xmlParts) {
+                    for (const c of p.chords) totalBars += c.bars;
+                }
                 $("xmlBarsTotal").textContent = totalBars.toFixed(1);
             }
         }, { passive: true });
@@ -1534,14 +1649,24 @@
                 }
             }
             renderXmlRows();
-            const totalBars = state.xmlParts.reduce((sum, p) => sum + p.chords.reduce((s, c) => s + c.bars, 0), 0);
+            let totalBars = 0;
+            for (const p of state.xmlParts) {
+                for (const c of p.chords) totalBars += c.bars;
+            }
             $("xmlBarsTotal").textContent = totalBars.toFixed(1);
+        }, { passive: true });
+
+        // Melody part selection change: just store the index
+        $("xmlMelodyPart").addEventListener("change", function() {
+            const val = this.value;
+            state.xmlMelodyPart = val === '' ? null : Number(val);
         }, { passive: true });
 
         $("xmlClear").addEventListener("click", () => {
             state.xmlParts = [];
             state.xmlName = "";
             state.xmlFormat = "";
+            state.xmlMelodyPart = null;
             $("xmlSettings").classList.add("hidden");
             $("xmlTableCard").classList.add("hidden");
             $("xmlPreviewCard").classList.add("hidden");
@@ -1556,11 +1681,36 @@
             const tempo = Math.min(300, Math.max(30, Number($("xmlTempo").value) || 120));
             const velocity = Math.min(127, Math.max(1, Number($("xmlVelocity").value) || 90));
 
-            // Build track data: each part becomes a track
-            const trackData = state.xmlParts.map(part => ({
-                name: part.partName || "Track",
-                chords: part.chords
-            }));
+            const trackData = [];
+
+            // For each part, decide if it's melody or chords based on selection
+            const melodyPartIdx = state.xmlMelodyPart;
+            for (let i = 0; i < state.xmlParts.length; i++) {
+                const part = state.xmlParts[i];
+                if (i === melodyPartIdx && part.melodyNotes.length) {
+                    // Export as melody (individual notes)
+                    trackData.push({
+                        type: 'melody',
+                        name: part.partName + ' (melody)',
+                        data: part.melodyNotes.map(n => ({ pitch: n.pitch, start: n.start, duration: n.duration }))
+                    });
+                } else {
+                    // Export as chords (grouped per measure)
+                    if (part.chords.length) {
+                        trackData.push({
+                            type: 'chord',
+                            name: part.partName + ' (chords)',
+                            data: part.chords
+                        });
+                    }
+                }
+            }
+
+            if (!trackData.length) {
+                $("xmlStatus").textContent = "No tracks to export.";
+                $("xmlStatus").className = "status error";
+                return;
+            }
 
             const midi = makeMultiTrackMidi(trackData, tempo, velocity);
             const name = state.xmlName ? `${state.xmlName}_MultiTrack.mid` : "MultiTrack.mid";
